@@ -1,6 +1,6 @@
 # Tools to work with MonCurse
 
-First, you need to unpack the game ([GDRE]("https://github.com/GDRETools/gdsdecomp/releases/download/v2.4.0/GDRE_tools-v2.4.0-linux.zip")) and get it into dev mode. Godot version [3.5.1](https://github.com/godotengine/godot/releases/3.5.1-stable/) alongside the `Godot_v3.5.1-stable_export_templates` if you wish to publish / test run your mods.
+First, you need to unpack the game ( [GDRE]("https://github.com/GDRETools/gdsdecomp/releases/download/v2.4.0/GDRE_tools-v2.4.0-linux.zip") ) and get it into dev mode. Godot version [3.5.1](https://github.com/godotengine/godot/releases/3.5.1-stable/) alongside the `Godot_v3.5.1-stable_export_templates` if you wish to publish / test run your mods.
 
 Use GDRE and extract the game into a godot project. Go figure out how if you don't. 
 

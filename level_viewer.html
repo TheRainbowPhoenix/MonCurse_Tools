@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Godot Advanced Level Viewer</title>
+    <style>
+        body { background: #202020; color: #ddd; font-family: 'Segoe UI', sans-serif; margin: 0; height: 100vh; display: flex; flex-direction: column; }
+        #toolbar { background: #333; padding: 10px 20px; display: flex; gap: 20px; align-items: center; border-bottom: 1px solid #444; box-shadow: 0 2px 5px rgba(0,0,0,0.5); z-index: 10; }
+        #drop-zone { border: 2px dashed #666; padding: 8px 30px; border-radius: 4px; cursor: pointer; background: #252525; transition: 0.2s; }
+        #drop-zone.hover { background: #444; border-color: #fff; color: #fff; }
+        #canvas-container { overflow: auto; position: relative; background-color: #111; width: 100%; height: 100%; }
+        /* Checkerboard pattern for transparency */
+        canvas { 
+            background-image: linear-gradient(45deg, #1a1a1a 25%, transparent 25%), linear-gradient(-45deg, #1a1a1a 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #1a1a1a 75%), linear-gradient(-45deg, transparent 75%, #1a1a1a 75%);
+            background-size: 20px 20px;
+            background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+            box-shadow: 0 0 30px #000; 
+            image-rendering: pixelated; 
+        }
+        .control-group { display: flex; align-items: center; gap: 10px; }
+        #status { font-size: 0.9em; color: #ff9d00; }
+    </style>
+</head>
+<body>
+
+<div id="toolbar">
+    <div id="drop-zone">Drag & Drop .bin Level</div>
+    <div class="control-group">
+        <label>Zoom:</label>
+        <input type="range" id="zoom" min="0.1" max="1.5" step="0.05" value="0.5">
+        <span id="zoom-val">50%</span>
+    </div>
+    <span id="status">Ready (Must run via Local Server)</span>
+</div>
+
+<div id="canvas-container">
+    <canvas id="gameCanvas"></canvas>
+</div>
+
+<script>
+
+// --- CONFIGURATION: Map Layer Names to .tres Files ---
+const RESOURCE_MAP = {
+    "constructbackground": "Tilemaps/constructbackground.tres",
+    "constructbackground/backgroundfeatures": "Tilemaps/backgroundfeatures.tres",
+    "constructmap": "Tilemaps/constructmap.tres",
+    "constructmapedges": "Tilemaps/constructmapedges.tres",
+    "Map": "Tilemaps/map.tres",
+    "Mapedges": "Tilemaps/mapedges.tres",
+    "Mapbackground": "Tilemaps/map.tres", // Uses same tileset usually
+    "paths": "Tilemaps/paths.tres",
+    "features": "Tilemaps/features.tres",
+    "roofmap": "Tilemaps/roofmap.tres",
+    "foliage": "Tilemaps/foliage.tres",
+    "shards": "Tilemaps/shards.tres",
+    "watermap": "Tilemaps/water.tres",
+    "watermaptops": "Tilemaps/water.tres", // Likely shares water
+    "cummap": "Tilemaps/cumtiles.tres",
+    "destructiblefeatures": "Tilemaps/isometrictiles.tres", // Educated guess based on name
+    "spawnmarker": "Tilemaps/overworldicons.tres" // Guess for debug markers
+};
+
+// Render Order (Bottom to Top)
+const RENDER_ORDER = [
+    "constructbackground",
+    "constructmap",
+    "constructmapedges",
+    "Mapbackground",
+    "Map",
+    "Mapedges",
+    "watermap",
+    "watermaptops",
+    "paths",
+    "cummap",
+    "constructbackground/backgroundfeatures",
+    "features",
+    "destructiblefeatures",
+    "foliage",
+    "roofmap",
+    "shards",
+    "spawnmarker"
+];
+
+const TILE_SIZE = 128;
+const BORDER_THICKNESS = 9;
+
+// --- BINARY PARSING CONSTANTS ---
+// Based on the script logic:
+const PARSE_TYPES = {
+    AUTOTILE: 1, // 3 bytes: Val, X, Y
+    FLIP: 2,     // 2 bytes: Val, FlipBool
+    SIMPLE: 3    // 1 byte:  Val
+};
+
+const LAYER_PARSE_TYPE = {
+    "constructmap": PARSE_TYPES.AUTOTILE,
+    "constructmapedges": PARSE_TYPES.AUTOTILE,
+    "constructbackground": PARSE_TYPES.AUTOTILE,
+    "Map": PARSE_TYPES.AUTOTILE,
+    "Mapedges": PARSE_TYPES.AUTOTILE,
+    "Mapbackground": PARSE_TYPES.AUTOTILE,
+    "roofmap": PARSE_TYPES.AUTOTILE,
+    "watermap": PARSE_TYPES.AUTOTILE,
+    
+    "constructbackground/backgroundfeatures": PARSE_TYPES.FLIP,
+    "features": PARSE_TYPES.FLIP,
+    "foliage": PARSE_TYPES.FLIP,
+    "cummap": PARSE_TYPES.FLIP,
+    "destructiblefeatures": PARSE_TYPES.FLIP,
+
+    "paths": PARSE_TYPES.SIMPLE,
+    "shards": PARSE_TYPES.SIMPLE,
+    "spawnmarker": PARSE_TYPES.SIMPLE,
+    "watermaptops": PARSE_TYPES.SIMPLE
+};
+
+// --- STATE ---
+const cache = {
+    tres: {},   // path -> { tiles: {id: data} }
+    images: {}  // path -> Image object
+};
+let mapData = null;
+let currentZoom = 0.5;
+
+// --- 1. TRES PARSER ---
+
+async function loadTres(path) {
+    if (cache.tres[path]) return cache.tres[path];
+
+    try {
+        const resPath = path.replace("res://", "./"); // Local relative path
+        const response = await fetch(resPath);
+        if (!response.ok) throw new Error("404");
+        const text = await response.text();
+
+        const data = { tiles: {} };
+        const extResources = {}; // id -> path
+
+        // 1. Find Ext Resources
+        // [ext_resource path="res://..." type="Texture" id=1]
+        const extRegex = /\[ext_resource path="res:\/\/(.*?)" type="Texture" id=(\d+)\]/g;
+        let match;
+        while ((match = extRegex.exec(text)) !== null) {
+            extResources[match[2]] = match[1];
+        }
+
+        // 2. Parse Tiles
+        // We look for lines starting with "ID/property = value"
+        const lines = text.split('\n');
+        
+        lines.forEach(line => {
+            const propMatch = line.match(/^(\d+)\/([\w\/]+)\s*=\s*(.*)/);
+            if (!propMatch) return;
+
+            const id = parseInt(propMatch[1]);
+            const prop = propMatch[2];
+            const val = propMatch[3];
+
+            if (!data.tiles[id]) data.tiles[id] = { id: id };
+
+            if (prop === 'texture') {
+                const resId = val.match(/ExtResource\(\s*(\d+)\s*\)/);
+                if (resId && extResources[resId[1]]) {
+                    data.tiles[id].texturePath = extResources[resId[1]];
+                }
+            } else if (prop === 'region') {
+                // Rect2( 0, 0, 128, 128 )
+                const rect = val.match(/Rect2\(\s*([\d.-]+),\s*([\d.-]+),\s*([\d.-]+),\s*([\d.-]+)\s*\)/);
+                if (rect) data.tiles[id].region = { x: +rect[1], y: +rect[2], w: +rect[3], h: +rect[4] };
+            } else if (prop === 'tex_offset') {
+                // Vector2( -64, 0 )
+                const vec = val.match(/Vector2\(\s*([\d.-]+),\s*([\d.-]+)\s*\)/);
+                if (vec) data.tiles[id].offset = { x: +vec[1], y: +vec[2] };
+            } else if (prop === 'autotile/tile_size') {
+                const vec = val.match(/Vector2\(\s*([\d.-]+),\s*([\d.-]+)\s*\)/);
+                if (vec) data.tiles[id].tileSize = { w: +vec[1], h: +vec[2] };
+            }
+        });
+
+        // 3. Preload Images
+        const imgPromises = Object.values(extResources).map(p => loadImage(p));
+        await Promise.all(imgPromises);
+
+        cache.tres[path] = data;
+        return data;
+
+    } catch (e) {
+        console.warn(`Could not load TRES: ${path}`, e);
+        return null;
+    }
+}
+
+function loadImage(path) {
+    return new Promise((resolve) => {
+        if (cache.images[path]) return resolve(cache.images[path]);
+        const img = new Image();
+        img.onload = () => { cache.images[path] = img; resolve(img); };
+        img.onerror = () => { console.warn("Missing Img:", path); cache.images[path] = null; resolve(null); };
+        img.src = "./" + path;
+    });
+}
+
+// --- 2. BINARY PARSER ---
+
+function parseBinary(buffer) {
+    const view = new DataView(buffer);
+    let p = 0;
+    const get8 = () => view.getUint8(p++);
+    // const get16 = () => { let v = view.getUint16(p, true); p+=2; return v; };
+
+    const width = get8();
+    const height = get8();
+    const layers = {};
+
+    // The order in the file matches the order in the array from the GDScript
+    const FILE_ORDER = [
+        "constructmap", "constructmapedges", "constructbackground", 
+        "constructbackground/backgroundfeatures", "Map", "Mapedges", 
+        "Mapbackground", "paths", "features", "roofmap", "foliage", 
+        "shards", "watermap", "cummap", "spawnmarker", 
+        "destructiblefeatures", "watermaptops"
+    ];
+
+    for (const name of FILE_ORDER) {
+        const type = LAYER_PARSE_TYPE[name];
+        const grid = [];
+
+        for (let x = 0; x < width; x++) {
+            const col = [];
+            for (let y = 0; y < height; y++) {
+                const val = get8();
+                let tile = { id: val - 1 }; // Godot binary often stores ID+1 so 0 is empty
+
+                if (type === PARSE_TYPES.AUTOTILE) {
+                    tile.ax = get8();
+                    tile.ay = get8();
+                } else if (type === PARSE_TYPES.FLIP) {
+                    tile.flip = (get8() === 1);
+                }
+                col.push(tile);
+            }
+            grid.push(col);
+        }
+        layers[name] = grid;
+    }
+    return { width, height, layers };
+}
+
+// --- 3. RENDERER ---
+
+async function render() {
+    if (!mapData) return;
+    const cvs = document.getElementById('gameCanvas');
+    const ctx = cvs.getContext('2d');
+
+    const s = TILE_SIZE * currentZoom;
+    const w = mapData.width;
+    const h = mapData.height;
+
+    // Canvas size includes borders
+    cvs.width = (w + BORDER_THICKNESS * 2) * s;
+    cvs.height = (h + BORDER_THICKNESS * 2) * s;
+
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0,0,cvs.width, cvs.height);
+
+    // Load all TRES files defined in config
+    const tresLoaders = Object.values(RESOURCE_MAP).map(p => loadTres(p));
+    await Promise.all(tresLoaders);
+
+    // Draw Loop
+    for (const layerName of RENDER_ORDER) {
+        const grid = mapData.layers[layerName];
+        if (!grid) continue;
+
+        const tresPath = RESOURCE_MAP[layerName];
+        const tresData = tresPath ? cache.tres[tresPath] : null;
+
+        for (let x = 0; x < w; x++) {
+            for (let y = 0; y < h; y++) {
+                const t = grid[x][y];
+                if (t.id < 0) continue;
+
+                // Position on canvas
+                const drawX = (x + BORDER_THICKNESS) * s;
+                const drawY = (y + BORDER_THICKNESS) * s;
+
+                // Try to draw texture
+                if (tresData && tresData.tiles[t.id] && tresData.tiles[t.id].texturePath) {
+                    const tileDef = tresData.tiles[t.id];
+                    const img = cache.images[tileDef.texturePath];
+
+                    if (img) {
+                        let sx = tileDef.region ? tileDef.region.x : 0;
+                        let sy = tileDef.region ? tileDef.region.y : 0;
+                        let sw = tileDef.region ? tileDef.region.w : img.width;
+                        let sh = tileDef.region ? tileDef.region.h : img.height;
+
+                        // Autotile offset
+                        if (t.ax !== undefined && tileDef.tileSize) {
+                            sx += t.ax * tileDef.tileSize.w;
+                            sy += t.ay * tileDef.tileSize.h;
+                            sw = tileDef.tileSize.w;
+                            sh = tileDef.tileSize.h;
+                        }
+
+                        // Apply Offset (e.g. Trees standing up)
+                        let renderX = drawX;
+                        let renderY = drawY;
+                        if (tileDef.offset) {
+                            renderX += tileDef.offset.x * currentZoom;
+                            renderY += tileDef.offset.y * currentZoom;
+                        }
+
+                        // Handle Flip
+                        if (t.flip) {
+                            ctx.save();
+                            ctx.translate(renderX + (sw*currentZoom), renderY);
+                            ctx.scale(-1, 1);
+                            ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw * currentZoom, sh * currentZoom);
+                            ctx.restore();
+                        } else {
+                            ctx.drawImage(img, sx, sy, sw, sh, renderX, renderY, sw * currentZoom, sh * currentZoom);
+                        }
+                        continue;
+                    }
+                }
+
+                // Fallback debug square if texture/tres failed
+                ctx.fillStyle = `rgba(255, 0, 255, 0.3)`;
+                ctx.fillRect(drawX, drawY, s, s);
+                ctx.strokeStyle = '#fff';
+                ctx.strokeRect(drawX, drawY, s, s);
+                ctx.fillStyle = '#fff';
+                ctx.font = '10px sans-serif';
+                ctx.fillText(t.id, drawX+5, drawY+15);
+            }
+        }
+    }
+}
+
+// --- EVENTS ---
+
+const dropZone = document.getElementById('drop-zone');
+const status = document.getElementById('status');
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('hover'); });
+dropZone.addEventListener('dragleave', e => dropZone.classList.remove('hover'));
+dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('hover');
+    const f = e.dataTransfer.files[0];
+    if(!f) return;
+
+    const r = new FileReader();
+    r.onload = async (evt) => {
+        try {
+            status.innerText = "Parsing Binary...";
+            mapData = parseBinary(evt.target.result);
+            status.innerText = "Loading Resources & Rendering...";
+            await render();
+            status.innerText = `Loaded: ${f.name} (${mapData.width}x${mapData.height})`;
+        } catch(err) {
+            console.error(err);
+            status.innerText = "Error. See Console.";
+        }
+    };
+    r.readAsArrayBuffer(f);
+});
+
+const zoomRange = document.getElementById('zoom');
+zoomRange.addEventListener('input', e => {
+    currentZoom = parseFloat(e.target.value);
+    document.getElementById('zoom-val').innerText = Math.round(currentZoom*100) + "%";
+    render();
+});
+
+</script>
+</body>
+</html>
